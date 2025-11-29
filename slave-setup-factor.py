@@ -6,8 +6,8 @@ set -e
 
 # ⚠️ CONFIGURATION À MODIFIER SELON VOS BESOINS ⚠️
 # Changez cette IP par celle de votre serveur master
-MASTER_HOST="91.69.7.150"
-MASTER_SSH_USER="serveurdechames"
+MASTER_HOST="82.66.207.144"
+MASTER_SSH_USER="Dell"
 MASTER_CADO_PORT="3001"
 
 GREEN='\033[0;32m'
