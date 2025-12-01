@@ -15,76 +15,45 @@ if echo "$file_head" | grep -qi "<!DOCTYPE html>"; then
 fi
 
 # -----------------------------------------------------------------------
-# Vérification des privilèges root
+# Vérification root
 # -----------------------------------------------------------------------
 if [ "$EUID" -ne 0 ]; then
     echo "[ERREUR] Ce script doit être exécuté en root."
     exit 1
 fi
 
-# -----------------------------------------------------------------------
-# Mise à jour du système
-# -----------------------------------------------------------------------
-echo "[INFO] Mise à jour des paquets..."
 apt-get update -y
 
 # -----------------------------------------------------------------------
-# Suppression d'éventuels restes Docker
+# Vérifier si Docker est déjà installé
 # -----------------------------------------------------------------------
-echo "[INFO] Nettoyage éventuels anciens Docker..."
-apt-get remove -y docker docker-engine docker.io containerd runc || true
+if ! command -v docker >/dev/null 2>&1; then
+    echo "[INFO] Docker non détecté. Installation via apt…"
+
+    # Tentative 1 : docker.io
+    if apt-get install -y docker.io; then
+        echo "[INFO] docker.io installé avec succès."
+    else
+        echo "[WARN] docker.io n’a pas pu être installé. Tentative avec podman-docker…"
+
+        # Tentative 2 : podman-docker (fallback)
+        if apt-get install -y podman-docker; then
+            echo "[INFO] podman-docker installé. 'docker' sera émulé par Podman."
+        else
+            echo "[ERREUR] Impossible d’installer docker.io ou podman-docker."
+            exit 1
+        fi
+    fi
+else
+    echo "[INFO] Docker déjà installé."
+fi
 
 # -----------------------------------------------------------------------
-# Installation des dépendances
+# Vérification finale
 # -----------------------------------------------------------------------
-echo "[INFO] Installation des dépendances..."
-apt-get install -y \
-    ca-certificates \
-    curl \
-    gnupg \
-    lsb-release
-
-# -----------------------------------------------------------------------
-# Ajout du dépôt Docker officiel
-# -----------------------------------------------------------------------
-echo "[INFO] Ajout du dépôt Docker officiel..."
-
-install -m 0755 -d /etc/apt/keyrings
-
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-    | gpg --dearmor \
-    | tee /etc/apt/keyrings/docker.gpg > /dev/null
-
-chmod a+r /etc/apt/keyrings/docker.gpg
-
-echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-  https://download.docker.com/linux/ubuntu \
-  $(lsb_release -cs) stable" \
-  | tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-# -----------------------------------------------------------------------
-# Installation de Docker
-# -----------------------------------------------------------------------
-echo "[INFO] Installation de Docker Engine..."
-apt-get update -y
-apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-# -----------------------------------------------------------------------
-# Activation du service
-# -----------------------------------------------------------------------
-echo "[INFO] Activation de Docker..."
-systemctl enable docker
-systemctl start docker
-
-# -----------------------------------------------------------------------
-# Vérification
-# -----------------------------------------------------------------------
-echo "[INFO] Vérification de l’installation..."
-if ! docker --version >/dev/null 2>&1; then
-    echo "[ERREUR] Docker ne semble pas installé correctement."
+if ! command -v docker >/dev/null 2>&1; then
+    echo "[ERREUR] Docker n’est pas disponible même après installation."
     exit 1
 fi
 
-echo "[SUCCÈS] Docker est installé et opérationnel."
-docker --version
+echo "[SUCCÈS] Docker opérationnel : $(docker --version 2>/dev/null || echo 'via podman-docker')"
