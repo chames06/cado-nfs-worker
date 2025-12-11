@@ -18,7 +18,7 @@ NC='\033[0m'
 MASTER_IP=""
 MASTER_USER=""
 MASTER_PASSWORD=""
-WORKER_PORT=22
+WORKER_PORT=13000
 HOSTFILE="$HOME/hostfile"
 SCREEN_SESSION="mpi_worker"
 
@@ -149,7 +149,7 @@ register_worker() {
     # Se connecter au master et ajouter le worker au hostfile
     print_info "Connexion au master $MASTER_IP..."
     
-    sshpass -p "$MASTER_PASSWORD" ssh -o StrictHostKeyChecking=no \
+    sshpass -p "$MASTER_PASSWORD" ssh -p "$WORKER_PORT" -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=10 \
         "${MASTER_USER}@${MASTER_IP}" <<EOF
@@ -199,7 +199,7 @@ setup_ssh_access() {
     # Récupérer la clé publique du master
     print_info "Récupération de la clé publique du master..."
     
-    sshpass -p "$MASTER_PASSWORD" ssh -o StrictHostKeyChecking=no \
+    sshpass -p "$MASTER_PASSWORD" ssh -p "$WORKER_PORT" -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
         "${MASTER_USER}@${MASTER_IP}" "cat ~/.ssh/id_rsa.pub 2>/dev/null || ssh-keygen -t rsa -N '' -f ~/.ssh/id_rsa >/dev/null 2>&1 && cat ~/.ssh/id_rsa.pub" >> ~/.ssh/authorized_keys
     
@@ -312,7 +312,7 @@ EOF
     fi
     
     # Test de connexion SSH au master
-    if sshpass -p "$MASTER_PASSWORD" ssh -o ConnectTimeout=5 \
+    if sshpass -p "$MASTER_PASSWORD" ssh -p "$WORKER_PORT" -o ConnectTimeout=5 \
         -o StrictHostKeyChecking=no \
         "${MASTER_USER}@${MASTER_IP}" "echo 'OK'" >/dev/null 2>&1; then
         print_info "Connexion au master: ✓"
@@ -361,7 +361,7 @@ interactive_config() {
     
     # Tester la connexion
     print_info "Test de connexion au master..."
-    if ! sshpass -p "$MASTER_PASSWORD" ssh -o ConnectTimeout=5 \
+    if ! sshpass -p "$MASTER_PASSWORD" ssh -p "$WORKER_PORT" -o ConnectTimeout=5 \
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
         "${MASTER_USER}@${MASTER_IP}" "echo 'OK'" >/dev/null 2>&1; then
