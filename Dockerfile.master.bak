@@ -1,0 +1,58 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Installation dépendances
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    libgmp-dev \
+    libhwloc-dev \
+    libecm-dev \
+    m4 \
+    python3 \
+    python3-pip \
+    curl \
+    wget \
+    jq \
+    docker.io \
+    supervisor \
+    netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python packages
+RUN pip3 install --no-cache-dir requests
+
+# Clone CADO-NFS
+WORKDIR /opt
+RUN git clone --depth 1 https://gitlab.inria.fr/cado-nfs/cado-nfs.git 2>/dev/null || \
+    git clone --depth 1 https://github.com/cado-nfs/cado-nfs.git cado-nfs
+
+# Compile CADO-NFS
+WORKDIR /opt/cado-nfs
+RUN cmake . -DCMAKE_BUILD_TYPE=Release && \
+    make -j$(nproc) 2>&1 | tee /tmp/cado_build.log || \
+    make 2>&1 | tee /tmp/cado_build_single.log
+
+# Vérifications
+RUN test -f /opt/cado-nfs/cado-nfs.py || (echo "ERROR: cado-nfs.py missing" && exit 1)
+RUN test -f /opt/cado-nfs/misc/convert_poly || echo "WARNING: convert_poly missing"
+
+# Créer répertoires
+RUN mkdir -p /opt/factoring/{jobs,results} && \
+    mkdir -p /tmp/sieving && \
+    mkdir -p /var/log/supervisor
+
+# Scripts
+COPY master_control.sh /usr/local/bin/
+COPY supervisord.conf /etc/supervisor/conf.d/
+RUN chmod +x /usr/local/bin/master_control.sh
+
+EXPOSE 3001
+
+VOLUME ["/var/run/docker.sock", "/opt/factoring", "/tmp/sieving"]
+
+WORKDIR /opt/factoring
+
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
