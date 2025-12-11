@@ -1,0 +1,487 @@
+#!/bin/bash
+
+#############################################
+# Script de configuration MPI Worker Auto
+# Les workers se connectent au master et se configurent automatiquement
+#############################################
+
+set -e
+
+# Couleurs
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# Configuration
+MASTER_IP=""
+MASTER_USER=""
+MASTER_PASSWORD=""
+WORKER_PORT=22
+HOSTFILE="$HOME/hostfile"
+SCREEN_SESSION="mpi_worker"
+
+print_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+print_error() { echo -e "${RED}[ERREUR]${NC} $1"; }
+print_warning() { echo -e "${YELLOW}[ATTENTION]${NC} $1"; }
+print_step() { echo -e "${BLUE}[ÉTAPE]${NC} $1"; }
+
+#############################################
+# Installation des dépendances
+#############################################
+
+install_dependencies() {
+    print_step "Installation des dépendances..."
+    
+    if [[ -f /etc/debian_version ]]; then
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq \
+            wget \
+            build-essential \
+            screen \
+            sshpass \
+            net-tools \
+            curl \
+            gcc \
+            g++ \
+            make \
+            gfortran 2>&1 | grep -v "^Setting up\|^Preparing\|^Unpacking" || true
+    elif [[ -f /etc/redhat-release ]]; then
+        sudo yum install -y -q \
+            wget \
+            screen \
+            sshpass \
+            net-tools \
+            curl \
+            gcc \
+            gcc-c++ \
+            make \
+            gcc-gfortran
+    else
+        print_error "Distribution non supportée"
+        exit 1
+    fi
+    
+    print_info "✓ Dépendances installées"
+}
+
+#############################################
+# Téléchargement et installation de OpenMPI
+#############################################
+
+install_openmpi() {
+    print_step "Téléchargement et installation de OpenMPI..."
+    
+    local MPI_VERSION="4.1.6"
+    local MPI_DIR="openmpi-${MPI_VERSION}"
+    local MPI_TAR="${MPI_DIR}.tar.gz"
+    local MPI_URL="https://download.open-mpi.org/release/open-mpi/v4.1/${MPI_TAR}"
+    local INSTALL_DIR="$HOME/openmpi"
+    
+    # Vérifier si déjà installé
+    if [[ -f "$INSTALL_DIR/bin/mpirun" ]]; then
+        print_info "✓ OpenMPI déjà installé dans $INSTALL_DIR"
+        export PATH="$INSTALL_DIR/bin:$PATH"
+        export LD_LIBRARY_PATH="$INSTALL_DIR/lib:$LD_LIBRARY_PATH"
+        return 0
+    fi
+    
+    cd /tmp
+    
+    print_info "Téléchargement de OpenMPI ${MPI_VERSION}..."
+    wget -q --show-progress "$MPI_URL" || {
+        print_error "Échec du téléchargement"
+        exit 1
+    }
+    
+    print_info "Extraction..."
+    tar -xzf "$MPI_TAR"
+    cd "$MPI_DIR"
+    
+    print_info "Configuration (cela peut prendre quelques minutes)..."
+    ./configure --prefix="$INSTALL_DIR" --enable-mpi-fortran 2>&1 | tail -n 5
+    
+    print_info "Compilation (cela peut prendre 10-15 minutes)..."
+    make -j$(nproc) 2>&1 | tail -n 5
+    
+    print_info "Installation..."
+    make install 2>&1 | tail -n 5
+    
+    # Configuration de l'environnement
+    cat >> ~/.bashrc <<EOF
+
+# OpenMPI Configuration
+export PATH="$INSTALL_DIR/bin:\$PATH"
+export LD_LIBRARY_PATH="$INSTALL_DIR/lib:\$LD_LIBRARY_PATH"
+export MANPATH="$INSTALL_DIR/share/man:\$MANPATH"
+EOF
+
+    export PATH="$INSTALL_DIR/bin:$PATH"
+    export LD_LIBRARY_PATH="$INSTALL_DIR/lib:$LD_LIBRARY_PATH"
+    
+    # Nettoyage
+    cd /tmp
+    rm -rf "$MPI_DIR" "$MPI_TAR"
+    
+    print_info "✓ OpenMPI ${MPI_VERSION} installé dans $INSTALL_DIR"
+    mpirun --version | head -n 1
+}
+
+#############################################
+# Configuration du worker
+#############################################
+
+register_worker() {
+    print_step "Enregistrement du worker sur le master..."
+    
+    local WORKER_IP=$(hostname -I | awk '{print $1}')
+    local WORKER_SLOTS=$(nproc)
+    local WORKER_HOSTNAME=$(hostname)
+    
+    print_info "IP du worker: $WORKER_IP"
+    print_info "Threads disponibles: $WORKER_SLOTS"
+    print_info "Hostname: $WORKER_HOSTNAME"
+    
+    # Créer l'entrée pour le hostfile
+    local HOSTFILE_ENTRY="$WORKER_IP slots=$WORKER_SLOTS # $WORKER_HOSTNAME"
+    
+    # Se connecter au master et ajouter le worker au hostfile
+    print_info "Connexion au master $MASTER_IP..."
+    
+    sshpass -p "$MASTER_PASSWORD" ssh -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=10 \
+        "${MASTER_USER}@${MASTER_IP}" <<EOF
+# Créer le hostfile si il n'existe pas
+if [[ ! -f ~/hostfile ]]; then
+    echo "# MPI Hostfile - Auto-généré" > ~/hostfile
+    echo "# Format: IP slots=N # hostname" >> ~/hostfile
+    echo "" >> ~/hostfile
+fi
+
+# Vérifier si le worker n'est pas déjà enregistré
+if ! grep -q "$WORKER_IP" ~/hostfile 2>/dev/null; then
+    echo "$HOSTFILE_ENTRY" >> ~/hostfile
+    echo "✓ Worker ajouté au hostfile"
+else
+    # Mettre à jour l'entrée existante
+    sed -i "/$WORKER_IP/d" ~/hostfile
+    echo "$HOSTFILE_ENTRY" >> ~/hostfile
+    echo "✓ Worker mis à jour dans le hostfile"
+fi
+
+# Afficher le hostfile
+echo ""
+echo "=== Contenu du hostfile ==="
+cat ~/hostfile
+EOF
+
+    if [[ $? -eq 0 ]]; then
+        print_info "✓ Worker enregistré avec succès sur le master"
+    else
+        print_error "Échec de l'enregistrement sur le master"
+        exit 1
+    fi
+}
+
+#############################################
+# Configuration SSH pour le master
+#############################################
+
+setup_ssh_access() {
+    print_step "Configuration de l'accès SSH depuis le master..."
+    
+    # S'assurer que le dossier .ssh existe
+    mkdir -p ~/.ssh
+    chmod 700 ~/.ssh
+    
+    # Récupérer la clé publique du master
+    print_info "Récupération de la clé publique du master..."
+    
+    sshpass -p "$MASTER_PASSWORD" ssh -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        "${MASTER_USER}@${MASTER_IP}" "cat ~/.ssh/id_rsa.pub 2>/dev/null || ssh-keygen -t rsa -N '' -f ~/.ssh/id_rsa >/dev/null 2>&1 && cat ~/.ssh/id_rsa.pub" >> ~/.ssh/authorized_keys
+    
+    chmod 600 ~/.ssh/authorized_keys
+    
+    print_info "✓ Accès SSH configuré pour le master"
+}
+
+#############################################
+# Démarrage du worker en mode daemon
+#############################################
+
+start_worker_daemon() {
+    print_step "Démarrage du worker en mode daemon..."
+    
+    # Créer le script de monitoring
+    cat > ~/mpi_worker_monitor.sh <<'EOF'
+#!/bin/bash
+
+MASTER_IP="__MASTER_IP__"
+MASTER_USER="__MASTER_USER__"
+WORKER_IP=$(hostname -I | awk '{print $1}')
+
+while true; do
+    # Vérifier la connexion au master toutes les 60 secondes
+    if ping -c 1 -W 2 "$MASTER_IP" >/dev/null 2>&1; then
+        echo "[$(date)] Master accessible - Worker $WORKER_IP opérationnel"
+    else
+        echo "[$(date)] ALERTE: Master non accessible!"
+    fi
+    sleep 60
+done
+EOF
+
+    # Remplacer les variables
+    sed -i "s|__MASTER_IP__|$MASTER_IP|g" ~/mpi_worker_monitor.sh
+    sed -i "s|__MASTER_USER__|$MASTER_USER|g" ~/mpi_worker_monitor.sh
+    chmod +x ~/mpi_worker_monitor.sh
+    
+    # Démarrer dans screen
+    screen -dmS "$SCREEN_SESSION" bash -c "~/mpi_worker_monitor.sh"
+    
+    print_info "✓ Worker daemon démarré dans screen session: $SCREEN_SESSION"
+    print_info "  Pour voir les logs: screen -r $SCREEN_SESSION"
+    print_info "  Pour détacher: Ctrl+A puis D"
+}
+
+#############################################
+# Création du service systemd (optionnel)
+#############################################
+
+create_systemd_service() {
+    print_step "Création du service systemd..."
+    
+    sudo tee /etc/systemd/system/mpi-worker.service > /dev/null <<EOF
+[Unit]
+Description=MPI Worker Service
+After=network.target
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$HOME
+ExecStart=$HOME/mpi_worker_monitor.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable mpi-worker.service
+    sudo systemctl start mpi-worker.service
+    
+    print_info "✓ Service systemd créé et démarré"
+    print_info "  Status: sudo systemctl status mpi-worker"
+}
+
+#############################################
+# Test de la configuration
+#############################################
+
+test_configuration() {
+    print_step "Test de la configuration..."
+    
+    # Test MPI local
+    cat > /tmp/mpi_hello.c <<'EOF'
+#include <mpi.h>
+#include <stdio.h>
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+    int world_rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+    char processor_name[MPI_MAX_PROCESSOR_NAME];
+    int name_len;
+    MPI_Get_processor_name(processor_name, &name_len);
+    printf("Hello from rank %d on %s\n", world_rank, processor_name);
+    MPI_Finalize();
+    return 0;
+}
+EOF
+
+    if mpicc /tmp/mpi_hello.c -o /tmp/mpi_hello 2>/dev/null; then
+        print_info "Test de compilation MPI: ✓"
+        mpirun -np 2 /tmp/mpi_hello
+    else
+        print_warning "Test de compilation MPI: ✗"
+    fi
+    
+    # Test de connexion SSH au master
+    if sshpass -p "$MASTER_PASSWORD" ssh -o ConnectTimeout=5 \
+        -o StrictHostKeyChecking=no \
+        "${MASTER_USER}@${MASTER_IP}" "echo 'OK'" >/dev/null 2>&1; then
+        print_info "Connexion au master: ✓"
+    else
+        print_warning "Connexion au master: ✗"
+    fi
+}
+
+#############################################
+# Affichage du résumé
+#############################################
+
+show_summary() {
+    echo ""
+    echo "=========================================="
+    echo "  Configuration Worker MPI Terminée!"
+    echo "=========================================="
+    echo ""
+    print_info "Master: $MASTER_USER@$MASTER_IP"
+    print_info "Worker IP: $(hostname -I | awk '{print $1}')"
+    print_info "Threads: $(nproc)"
+    print_info "Screen session: $SCREEN_SESSION"
+    echo ""
+    echo "Commandes utiles:"
+    echo "  - Voir les logs: screen -r $SCREEN_SESSION"
+    echo "  - Tester MPI: mpirun -np 2 hostname"
+    echo "  - Voir le hostfile master: sshpass -p '$MASTER_PASSWORD' ssh ${MASTER_USER}@${MASTER_IP} 'cat ~/hostfile'"
+    echo "  - Status service: sudo systemctl status mpi-worker"
+    echo ""
+}
+
+#############################################
+# Menu de configuration
+#############################################
+
+interactive_config() {
+    echo "=========================================="
+    echo "  Configuration Worker MPI"
+    echo "=========================================="
+    echo ""
+    
+    read -p "IP du Master: " MASTER_IP
+    read -p "Utilisateur Master: " MASTER_USER
+    read -s -p "Mot de passe Master: " MASTER_PASSWORD
+    echo ""
+    
+    # Tester la connexion
+    print_info "Test de connexion au master..."
+    if ! sshpass -p "$MASTER_PASSWORD" ssh -o ConnectTimeout=5 \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        "${MASTER_USER}@${MASTER_IP}" "echo 'OK'" >/dev/null 2>&1; then
+        print_error "Impossible de se connecter au master!"
+        exit 1
+    fi
+    print_info "✓ Connexion au master réussie"
+}
+
+#############################################
+# Installation complète
+#############################################
+
+full_install() {
+    clear
+    echo "=========================================="
+    echo "  Installation Worker MPI"
+    echo "=========================================="
+    echo ""
+    
+    interactive_config
+    install_dependencies
+    install_openmpi
+    setup_ssh_access
+    register_worker
+    start_worker_daemon
+    
+    read -p "Créer un service systemd? (o/N): " create_service
+    if [[ "$create_service" =~ ^[oO]$ ]]; then
+        create_systemd_service
+    fi
+    
+    test_configuration
+    show_summary
+}
+
+#############################################
+# Mode ligne de commande
+#############################################
+
+usage() {
+    cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+    -m, --master IP         IP du master
+    -u, --user USER         Nom d'utilisateur du master
+    -p, --password PASS     Mot de passe du master
+    -a, --auto              Mode automatique (sans prompts)
+    -h, --help              Afficher l'aide
+
+Exemples:
+    $0                                                    # Mode interactif
+    $0 -m 192.168.1.10 -u mpiuser -p password123 -a     # Mode automatique
+EOF
+}
+
+#############################################
+# Main
+#############################################
+
+main() {
+    local AUTO_MODE=0
+    
+    # Parser les arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -m|--master)
+                MASTER_IP="$2"
+                shift 2
+                ;;
+            -u|--user)
+                MASTER_USER="$2"
+                shift 2
+                ;;
+            -p|--password)
+                MASTER_PASSWORD="$2"
+                shift 2
+                ;;
+            -a|--auto)
+                AUTO_MODE=1
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                print_error "Option inconnue: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Mode automatique ou interactif
+    if [[ $AUTO_MODE -eq 1 ]]; then
+        if [[ -z "$MASTER_IP" ]] || [[ -z "$MASTER_USER" ]] || [[ -z "$MASTER_PASSWORD" ]]; then
+            print_error "En mode automatique, tous les paramètres sont requis!"
+            usage
+            exit 1
+        fi
+        
+        print_info "Mode automatique activé"
+        install_dependencies
+        install_openmpi
+        setup_ssh_access
+        register_worker
+        start_worker_daemon
+        create_systemd_service
+        show_summary
+    else
+        full_install
+    fi
+}
+
+# Vérifier si root
+if [[ $EUID -eq 0 ]]; then
+    print_error "Ne pas exécuter ce script en tant que root!"
+    exit 1
+fi
+
+main "$@"
